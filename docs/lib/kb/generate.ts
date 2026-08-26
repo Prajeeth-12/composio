@@ -224,7 +224,7 @@ function rewriteSourceRepositoryLinks(markdown: string, guide: KbGuide, guides: 
   );
 }
 
-function guideMdx(guide: KbGuide, guides: KbGuide[], sourceCommit: string): string {
+function guideMdx(guide: KbGuide, guides: KbGuide[]): string {
   const related = relatedResources(guide, guides);
   const toolkitSlugs = toolkitSlugsForGuide(guide);
   const frontmatter = [
@@ -233,7 +233,6 @@ function guideMdx(guide: KbGuide, guides: KbGuide[], sourceCommit: string): stri
     `description: ${yamlString(guide.description)}`,
     `keywords: ${yamlArray([...guide.tags, ...guide.topics, ...guide.aliases])}`,
     `sources: ${JSON.stringify(guide.sources)}`,
-    `sourceCommit: ${yamlString(sourceCommit)}`,
     `lastVerifiedAt: ${yamlString(guide.lastVerifiedAt ?? '')}`,
     `reviewAfter: ${yamlString(guide.reviewAfter ?? '')}`,
     `freshness: ${yamlString(guide.freshness)}`,
@@ -271,7 +270,7 @@ function buildExpectedFiles(catalog: KbCatalog): Map<string, string> {
     `${JSON.stringify({ title: 'Guides', pages: guides.map(guide => guide.slug) }, null, 2)}\n`
   );
   for (const guide of guides) {
-    files.set(`guide/${guide.slug}.mdx`, guideMdx(guide, guides, catalog.manifest.source.commit));
+    files.set(`guide/${guide.slug}.mdx`, guideMdx(guide, guides));
   }
   return files;
 }

@@ -235,11 +235,35 @@ describe('public KB content generation', () => {
       const body = generated.split('\n---\n').at(-1)?.trim() ?? '';
       expect(body.length).toBeGreaterThan(0);
       expect(body).not.toMatch(/\]\(\.\.?\/[^)]*public\.md/);
-      expect(generated).toContain(`sourceCommit: "${manifest.source.commit}"`);
       expect(generated).toContain(`sources: ${JSON.stringify(definition.sources)}`);
       expect(generated).toContain(`lastVerifiedAt: "${definition.lastVerifiedAt}"`);
       expect(generated).toContain(`reviewAfter: "${definition.reviewAfter}"`);
       expect(generated).not.toContain('articlePath:');
+    }
+  });
+
+  test('does not rewrite generated pages when only the source snapshot commit changes', () => {
+    const originalDir = mkdtempSync(join(tmpdir(), 'composio-kb-original-'));
+    const repinnedDir = mkdtempSync(join(tmpdir(), 'composio-kb-repinned-'));
+    temporaryDirectories.push(originalDir, repinnedDir);
+    const catalog = getKbCatalog();
+    const repinnedCatalog = {
+      ...catalog,
+      manifest: {
+        ...catalog.manifest,
+        source: { ...catalog.manifest.source, commit: 'different-source-commit' },
+      },
+    };
+
+    generateKbContent({ outputDir: originalDir, catalog });
+    generateKbContent({ outputDir: repinnedDir, catalog: repinnedCatalog });
+
+    const files = listFiles(originalDir);
+    expect(listFiles(repinnedDir)).toEqual(files);
+    for (const file of files) {
+      expect(readFileSync(join(repinnedDir, file), 'utf8')).toBe(
+        readFileSync(join(originalDir, file), 'utf8'),
+      );
     }
   });
 
