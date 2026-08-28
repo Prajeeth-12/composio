@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 const workflowPath = resolve(process.cwd(), '..', '.github', 'workflows', 'docs-update-kb.yml');
 const semanticRefreshWorkflowPath = resolve(
@@ -52,6 +54,31 @@ function workflowSteps(path: string, job: string): WorkflowStep[] {
     jobs?: Record<string, { steps?: WorkflowStep[] }>;
   };
   return workflow.jobs?.[job]?.steps ?? [];
+}
+
+function git(root: string, ...args: string[]): string {
+  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(result.stderr);
+  return result.stdout.trim();
+}
+
+function runWorkflowStep(
+  step: WorkflowStep | undefined,
+  cwd: string,
+  env: Record<string, string>,
+): { output: string; stdout: string } {
+  const outputPath = join(cwd, 'github-output.txt');
+  writeFileSync(outputPath, '', 'utf8');
+  const result = spawnSync('bash', ['-euo', 'pipefail', '-c', step?.run ?? ''], {
+    cwd,
+    encoding: 'utf8',
+    env: { ...process.env, ...env, GITHUB_OUTPUT: outputPath },
+  });
+  if (result.status !== 0) throw new Error(`${result.stdout}\n${result.stderr}`);
+  return {
+    output: readFileSync(outputPath, 'utf8'),
+    stdout: result.stdout,
+  };
 }
 
 describe('support knowledge refresh workflow', () => {
@@ -252,12 +279,159 @@ echo "head_ref=$live_head_ref" >> "$GITHUB_OUTPUT"`);
     expect(workflow).toContain('actions/download-artifact@');
   });
 
-  test('can refresh immediately or discover upstream changes on a schedule', () => {
-    const workflow = readFileSync(workflowPath, 'utf8');
+  test('validates the dispatched source commit before coalescing newer events', () => {
+    const workflow = Bun.YAML.parse(readFileSync(workflowPath, 'utf8')) as {
+      on?: {
+        repository_dispatch?: { types?: string[] };
+        workflow_dispatch?: unknown;
+      };
+      jobs?: Record<string, WorkflowJob>;
+    };
+    const steps = workflow.jobs?.refresh?.steps ?? [];
+    const checkout = steps.find(step => step.name === 'Checkout support knowledge');
+    const resolveSource = steps.find(step => step.name === 'Resolve upstream change');
 
-    expect(workflow).toContain('support-knowledge-updated');
-    expect(workflow).toContain('schedule:');
-    expect(workflow).toContain('workflow_dispatch:');
+    expect(workflow.on?.repository_dispatch?.types).toEqual(['support-knowledge-updated']);
+    expect(workflow.on).toHaveProperty('workflow_dispatch');
+    expect(checkout?.with?.ref).toBe(
+      "${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_commit || 'main' }}",
+    );
+    expect(resolveSource?.env?.REQUESTED_SOURCE_COMMIT).toBe(
+      "${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_commit || '' }}",
+    );
+    expect(resolveSource?.run).toContain(
+      'does not match dispatched commit $REQUESTED_SOURCE_COMMIT',
+    );
+  });
+
+  test('reconciles missed support knowledge events once per day', () => {
+    const workflow = Bun.YAML.parse(readFileSync(workflowPath, 'utf8')) as {
+      on?: { schedule?: Array<{ cron?: string }> };
+    };
+
+    expect(workflow.on?.schedule).toEqual([{ cron: '17 0 * * *' }]);
+  });
+
+  test('serializes refreshes and checks complete upstream history', () => {
+    const workflow = Bun.YAML.parse(readFileSync(workflowPath, 'utf8')) as {
+      concurrency?: { group?: string; 'cancel-in-progress'?: boolean };
+      jobs?: Record<string, WorkflowJob>;
+    };
+    const checkout = workflow.jobs?.refresh?.steps?.find(
+      step => step.name === 'Checkout support knowledge',
+    );
+
+    expect(workflow.concurrency).toEqual({
+      group: 'docs-support-knowledge-refresh',
+      'cancel-in-progress': true,
+    });
+    expect(checkout?.with?.['fetch-depth']).toBe(0);
+  });
+
+  test('refreshes only when public support knowledge changed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'kb-workflow-public-diff-'));
+    const sourceRoot = join(root, 'support-knowledge');
+    const docsRoot = join(root, 'docs');
+    mkdirSync(join(sourceRoot, 'toolkits', 'github'), { recursive: true });
+    mkdirSync(join(docsRoot, 'kb'), { recursive: true });
+
+    try {
+      git(sourceRoot, 'init');
+      git(sourceRoot, 'config', 'user.name', 'KB Workflow Test');
+      git(sourceRoot, 'config', 'user.email', 'kb-workflow@example.com');
+      writeFileSync(join(sourceRoot, 'toolkits/github/public.md'), 'public v1\n', 'utf8');
+      writeFileSync(
+        join(sourceRoot, 'toolkits/github/customer-safe.md'),
+        'customer-safe v1\n',
+        'utf8',
+      );
+      git(sourceRoot, 'add', '.');
+      git(sourceRoot, 'commit', '-m', 'initial knowledge');
+      const currentCommit = git(sourceRoot, 'rev-parse', 'HEAD');
+      writeFileSync(
+        join(docsRoot, 'kb/manifest.json'),
+        `${JSON.stringify({ source: { commit: currentCommit } })}\n`,
+        'utf8',
+      );
+
+      writeFileSync(
+        join(sourceRoot, 'toolkits/github/customer-safe.md'),
+        'customer-safe v2\n',
+        'utf8',
+      );
+      git(sourceRoot, 'add', '.');
+      git(sourceRoot, 'commit', '-m', 'customer-safe only');
+      git(sourceRoot, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+
+      const resolveSource = workflowSteps(workflowPath, 'refresh').find(
+        step => step.name === 'Resolve upstream change',
+      );
+      const privateOnly = runWorkflowStep(resolveSource, docsRoot, {
+        SOURCE_ROOT: sourceRoot,
+        HAVE_UPSTREAM: 'true',
+        EVENT_NAME: 'schedule',
+        REQUESTED_SOURCE_COMMIT: '',
+      });
+      expect(privateOnly.output).toBe(
+        `commit=${currentCommit}\nupstream_changed=false\n`,
+      );
+
+      writeFileSync(join(sourceRoot, 'toolkits/github/public.md'), 'public v2\n', 'utf8');
+      git(sourceRoot, 'add', '.');
+      git(sourceRoot, 'commit', '-m', 'public knowledge');
+      const publicCommit = git(sourceRoot, 'rev-parse', 'HEAD');
+      writeFileSync(
+        join(sourceRoot, 'toolkits/github/customer-safe.md'),
+        'customer-safe v3\n',
+        'utf8',
+      );
+      git(sourceRoot, 'add', '.');
+      git(sourceRoot, 'commit', '-m', 'customer-safe after public knowledge');
+      git(sourceRoot, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+
+      const publicThenPrivate = runWorkflowStep(resolveSource, docsRoot, {
+        SOURCE_ROOT: sourceRoot,
+        HAVE_UPSTREAM: 'true',
+        EVENT_NAME: 'schedule',
+        REQUESTED_SOURCE_COMMIT: '',
+      });
+      expect(publicThenPrivate.output).toBe(
+        `commit=${currentCommit}\ncommit=${publicCommit}\nupstream_changed=true\n`,
+      );
+
+      writeFileSync(join(sourceRoot, 'toolkits/github/public.md'), 'public v3\n', 'utf8');
+      git(sourceRoot, 'add', '.');
+      git(sourceRoot, 'commit', '-m', 'newer public knowledge');
+      const newestPublicCommit = git(sourceRoot, 'rev-parse', 'HEAD');
+      git(sourceRoot, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+      git(sourceRoot, 'checkout', '--detach', publicCommit);
+
+      const delayedDispatch = runWorkflowStep(resolveSource, docsRoot, {
+        SOURCE_ROOT: sourceRoot,
+        HAVE_UPSTREAM: 'true',
+        EVENT_NAME: 'repository_dispatch',
+        REQUESTED_SOURCE_COMMIT: publicCommit,
+      });
+      expect(delayedDispatch.output).toBe(
+        `commit=${currentCommit}\ncommit=${newestPublicCommit}\nupstream_changed=true\n`,
+      );
+      expect(git(sourceRoot, 'rev-parse', 'HEAD')).toBe(newestPublicCommit);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('fails an unpinned or unreadable dispatched refresh instead of silently skipping it', () => {
+    const steps = workflowSteps(workflowPath, 'refresh');
+    const resolveSource = steps.find(step => step.name === 'Resolve upstream change');
+
+    expect(resolveSource?.env?.EVENT_NAME).toBe('${{ github.event_name }}');
+    expect(resolveSource?.run).toContain(
+      'Dispatched support knowledge refresh is missing source_commit.',
+    );
+    expect(resolveSource?.run).toContain(
+      'Cannot process a dispatched support knowledge refresh without an upstream token.',
+    );
   });
 
   test('tracks failures until both refresh and PR proposal recover', () => {
