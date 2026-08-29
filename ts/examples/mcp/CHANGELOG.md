@@ -1,5 +1,14 @@
 # mcp-example
 
+## 0.1.2
+
+### Patch Changes
+
+- Updated dependencies [8a56383]
+- Updated dependencies [9447932]
+  - @composio/core@0.18.1
+  - @composio/vercel@0.12.0
+
 ## 0.1.1
 
 ### Patch Changes

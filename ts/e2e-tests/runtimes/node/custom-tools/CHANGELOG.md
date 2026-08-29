@@ -1,5 +1,12 @@
 # @e2e-tests/node-custom-tools
 
+## 0.0.2
+
+### Patch Changes
+
+- Updated dependencies [8a56383]
+  - @composio/core@0.18.1
+
 ## 0.0.1
 
 ### Patch Changes

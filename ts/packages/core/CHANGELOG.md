@@ -1,5 +1,11 @@
 # @composio/core
 
+## 0.18.1
+
+### Patch Changes
+
+- 8a56383: Fix: automatic S3 file downloads are now capped at 100 MiB (configurable per call) to prevent memory exhaustion from oversized or streaming responses.
+
 ## 0.18.0
 
 ### Minor Changes
